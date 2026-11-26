@@ -1,0 +1,1359 @@
+local Config = {
+    Title = "AURORA / LIQUID",
+    ToggleKey = Enum.KeyCode.RightShift,
+    SnowCount = 48,
+    DamageHold = 3.2,
+    IslandTop = 8,
+    IslandScale = 0.76,
+    WindowWidth = 0.96,
+    MusicApi = "https://music.163.com",
+    MusicCache = "AuroraMusicCache",
+    Volume = 0.55,
+}
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Input = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local SoundService = game:GetService("SoundService")
+local player = Players.LocalPlayer
+assert(player, "AURORA 需要在 Roblox 客户端 LocalScript 中运行")
+local playerGui = player:WaitForChild("PlayerGui")
+local runtimeEnv = _G
+pcall(function() runtimeEnv = getgenv() end)
+if type(runtimeEnv.AuroraWindUI) == "table" and type(runtimeEnv.AuroraWindUI.Destroy) == "function" then runtimeEnv.AuroraWindUI.Destroy() end
+local previous = playerGui:FindFirstChild("AuroraLiquid")
+if previous then previous:Destroy() end
+
+local palettes = {
+    White = { ink = Color3.fromRGB(230, 230, 232), panel = Color3.fromRGB(248, 248, 250),
+        card = Color3.fromRGB(245, 245, 247), white = Color3.fromRGB(27, 27, 30),
+        muted = Color3.fromRGB(73, 73, 81), accent = Color3.fromRGB(33, 33, 36),
+        border = Color3.fromRGB(255, 255, 255), icon = Color3.fromRGB(63, 63, 70),
+        onAccent = Color3.fromRGB(255, 255, 255), off = Color3.fromRGB(193, 193, 199) },
+    Black = { ink = Color3.fromRGB(17, 17, 19), panel = Color3.fromRGB(23, 23, 26),
+        card = Color3.fromRGB(36, 36, 40), white = Color3.fromRGB(247, 247, 249),
+        muted = Color3.fromRGB(200, 200, 208), accent = Color3.fromRGB(242, 242, 246),
+        border = Color3.fromRGB(112, 112, 122), icon = Color3.fromRGB(218, 218, 225),
+        onAccent = Color3.fromRGB(22, 22, 25), off = Color3.fromRGB(73, 73, 81) },
+}
+local C = {}
+for key, value in pairs(palettes.White) do C[key] = value end
+C.green, C.red = Color3.fromRGB(43, 159, 120), Color3.fromRGB(222, 86, 108)
+C.islandText, C.islandMuted = Color3.fromRGB(250, 250, 252), Color3.fromRGB(170, 174, 183)
+C.islandGreen, C.islandRed = Color3.fromRGB(112, 233, 169), Color3.fromRGB(255, 110, 130)
+local themeNodes = {}
+local setTheme, setMusicVisible
+local function themed(node, property, key)
+    themeNodes[#themeNodes + 1] = { node = node, property = property, key = key }
+    node[property] = C[key]
+    return node
+end
+
+local W, H, MW = 884, 620, 884
+local state = {
+    open = false, page = 1, snow = true, depth = true, motion = true,
+    alerts = true, density = 2, snowSpeed = 1, scale = 1, theme = "White", musicVisible = true,
+}
+local alive, fitScale, clock = true, 1, 0
+local connections, characterConnections, humanoidConnections, tracks = {}, {}, {}, {}
+local random = Random.new()
+local UI, pages, nav, flakes, cards, switches = {}, {}, {}, {}, {}, {}
+local setOpen, setPage, fit, notify, resetPosition, destroy, syncIsland
+local M = { version = 0, searchVersion = 0, loaded = false, loading = false, queue = {}, index = 0, cache = {} }
+local health = { current = 0, maximum = 100, bound = false, total = 0, hits = 0, peak = 0 }
+local island = { mode = "idle", deadline = 0, damage = 0, lastHit = -100, demo = false }
+local character, humanoid, drag
+local moveOffset, tilt = Vector2.zero, Vector2.zero
+local musicInputDefaults = setmetatable({}, { __mode = "k" })
+local function musicInput(enabled)
+    if not UI.musicPanel then return end
+    local nodes = UI.musicPanel:GetDescendants()
+    nodes[#nodes + 1] = UI.musicPanel
+    for _, node in ipairs(nodes) do
+        if node:IsA("GuiObject") then
+            local defaults = musicInputDefaults[node]
+            if not defaults then
+                defaults = { active = node.Active }
+                if node:IsA("ScrollingFrame") then defaults.scrolling = node.ScrollingEnabled end
+                if node:IsA("TextBox") then defaults.editable = node.TextEditable end
+                musicInputDefaults[node] = defaults
+            end
+            node.Active = enabled and defaults.active or false
+            if node:IsA("GuiButton") then node.Interactable = enabled end
+            if node:IsA("ScrollingFrame") then node.ScrollingEnabled = enabled and defaults.scrolling or false end
+            if node:IsA("TextBox") then
+                node.TextEditable = enabled and defaults.editable or false
+                if not enabled then node:ReleaseFocus() end
+            end
+        end
+    end
+end
+local homePosition = Vector2.zero
+local musicHomePosition = Vector2.zero
+local function make(class, props, parent)
+    local object = Instance.new(class)
+    for key, value in pairs(props) do object[key] = value end
+    object.Parent = parent
+    return object
+end
+local function bind(signal, callback, bag)
+    local connection = signal:Connect(callback)
+    table.insert(bag or connections, connection)
+    return connection
+end
+local function disconnect(bag)
+    for _, connection in ipairs(bag) do connection:Disconnect() end
+    table.clear(bag)
+end
+local function round(object, radius)
+    make("UICorner", { CornerRadius = UDim.new(0, radius) }, object)
+    return object
+end
+local function frame(parent, name, x, y, w, h, color, radius, alpha)
+    local node = make("Frame", {
+        Name = name, Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+        BackgroundColor3 = color or C.card, BackgroundTransparency = alpha or 0,
+        BorderSizePixel = 0,
+    }, parent)
+    if radius then round(node, radius) end
+    for _, key in ipairs({ "ink", "panel", "card", "white", "muted", "accent", "border", "icon" }) do
+        if node.BackgroundColor3 == C[key] then themed(node, "BackgroundColor3", key); break end
+    end
+    return node
+end
+local function text(parent, value, x, y, w, h, size, color, bold)
+    local node = make("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.fromOffset(x, y),
+        Size = UDim2.fromOffset(w, h), Text = value, TextSize = math.max(13, size), TextTransparency = 0,
+        TextColor3 = color or C.white, Font = bold and Enum.Font.GothamBold or Enum.Font.GothamSemibold,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, parent)
+    for _, key in ipairs({ "white", "muted", "accent", "icon" }) do
+        if node.TextColor3 == C[key] then themed(node, "TextColor3", key); break end
+    end
+    return node
+end
+local function stroke(object, alpha, color, thickness)
+    return make("UIStroke", {
+        Color = color or C.accent, Transparency = alpha or 0.85,
+        Thickness = thickness or 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, object)
+end
+local function gradient(object, top, bottom, rotation)
+    return make("UIGradient", { Color = ColorSequence.new(top, bottom), Rotation = rotation or 90 }, object)
+end
+local function tween(object, props, duration, easing)
+    if not alive then return end
+    local bag = tracks[object] or {}
+    for key in pairs(props) do if bag[key] then bag[key]:Cancel() end end
+    tracks[object] = bag
+    local animation = TweenService:Create(object, TweenInfo.new(state.motion and (duration or 0.35) or 0.01,
+        easing or Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
+    for key in pairs(props) do bag[key] = animation end
+    animation.Completed:Once(function()
+        for key in pairs(props) do if bag[key] == animation then bag[key] = nil end end
+        if next(bag) == nil and tracks[object] == bag then tracks[object] = nil end
+    end)
+    animation:Play()
+    return animation
+end
+local function button(parent, value, x, y, w, h, light)
+    local node = round(make("TextButton", {
+        Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+        Text = value, TextSize = 16, TextColor3 = light and C.onAccent or C.white,
+        Font = Enum.Font.GothamBold, BackgroundColor3 = light and C.accent or C.card, BackgroundTransparency = light and 0 or 0.32,
+        BorderSizePixel = 0, AutoButtonColor = false,
+    }, parent), 16)
+    themed(node, "BackgroundColor3", light and "accent" or "card")
+    themed(node, "TextColor3", light and "onAccent" or "white")
+    local scale = make("UIScale", { Scale = 1 }, node)
+    local baseAlpha = light and 0 or 0.32
+    bind(node.MouseEnter, function()
+        if node.BackgroundTransparency < 1 then tween(node, { BackgroundTransparency = math.max(0, baseAlpha - 0.14) }, 0.18) end
+    end)
+    bind(node.MouseLeave, function()
+        if node.BackgroundTransparency < 1 then tween(node, { BackgroundTransparency = baseAlpha }, 0.18) end
+        tween(scale, { Scale = 1 }, 0.48, Enum.EasingStyle.Elastic)
+    end)
+    bind(node.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            tween(scale, { Scale = 0.92 }, 0.12)
+        end
+    end)
+    bind(node.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            tween(scale, { Scale = 1 }, 0.58, Enum.EasingStyle.Elastic)
+        end
+    end)
+    return node
+end
+local function card(parent, name, x, y, w, h)
+    local node = frame(parent, name, x, y, w, h, C.card, 23, 0.14)
+    gradient(node, Color3.new(1, 1, 1), Color3.fromRGB(219, 219, 224), 110)
+    stroke(node, 0.27, C.border)
+    local data = { node = node, x = x, y = y, page = parent, order = 1 }
+    for _, entry in ipairs(cards) do if entry.page == parent then data.order = data.order + 1 end end
+    cards[#cards + 1] = data
+    return node
+end
+local function switch(parent, title, detail, y, getter, setter)
+    local width = parent.Size.X.Offset
+    text(parent, title, 24, y, width - 116, 29, 18, C.white, true)
+    text(parent, detail, 24, y + 33, width - 48, 24, 13, C.muted)
+    local hit = button(parent, "", width - 82, y + 6, 58, 34)
+    round(hit, 24)
+    local knob = frame(hit, "Thumb", 28, 4, 26, 26, Color3.new(1, 1, 1), 24)
+    local function refresh()
+        local on = getter()
+        tween(hit, { BackgroundColor3 = on and C.accent or C.off }, 0.23)
+        tween(knob, { Position = UDim2.fromOffset(on and 28 or 4, 4) }, 0.23)
+    end
+    bind(hit.Activated, function() setter(not getter()); refresh() end)
+    switches[#switches + 1] = refresh
+    refresh()
+end
+local function choice(parent, title, y, values, getter, setter)
+    local available = parent.Size.X.Offset - 48
+    text(parent, title, 24, y, available, 28, 18, C.white, true)
+    local buttons = {}
+    local function refresh()
+        for i, node in ipairs(buttons) do
+            tween(node, { BackgroundColor3 = getter() == i and C.accent or C.card,
+                TextColor3 = getter() == i and C.onAccent or C.muted }, 0.25)
+        end
+    end
+    for i, value in ipairs(values) do
+        local width = (available - (#values - 1) * 8) / #values
+        buttons[i] = button(parent, value, 24 + (i - 1) * (width + 8), y + 42, width, 40)
+        buttons[i].TextSize = 14
+        bind(buttons[i].Activated, function() setter(i); refresh() end)
+    end
+    switches[#switches + 1] = refresh
+    refresh()
+end
+
+UI.gui = make("ScreenGui", {
+    Name = "AuroraLiquid", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 130, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+UI.screen = frame(UI.gui, "Screen", 0, 0, 0, 0, C.ink, nil, 1)
+UI.screen.Size = UDim2.fromScale(1, 1)
+UI.snow = frame(UI.screen, "SlowSnow", 0, 0, 0, 0, C.white, nil, 1)
+UI.snow.Size = UDim2.fromScale(1, 1)
+UI.snow.ClipsDescendants = true
+UI.snow.ZIndex = 1
+UI.root = frame(UI.screen, "SplitWindow", 0, 0, W, H, C.ink, nil, 1)
+UI.root.AnchorPoint = Vector2.new(0.5, 0.5)
+UI.root.Position = UDim2.fromScale(0.5, 0.55)
+UI.root.ZIndex = 5
+UI.scale = make("UIScale", { Scale = 1 }, UI.root)
+UI.progress = make("NumberValue", { Value = 0 }, UI.gui)
+UI.shell = round(make("CanvasGroup", {
+    Name = "UnifiedShell", Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.panel,
+    BorderSizePixel = 0, GroupTransparency = 1, ClipsDescendants = true,
+}, UI.root), 20)
+stroke(UI.shell, 0.45, C.border)
+UI.shell.BackgroundTransparency = 0.1
+UI.shell:FindFirstChildOfClass("UICorner").CornerRadius = UDim.new(0, 32)
+themed(UI.shell, "BackgroundColor3", "panel")
+gradient(UI.shell, Color3.new(1, 1, 1), Color3.fromRGB(214, 214, 220), 115)
+UI.zoom = make("NumberValue", { Value = 0.04 }, UI.gui)
+UI.travel = make("NumberValue", { Value = 1 }, UI.gui)
+local rim = frame(UI.shell, "GlassRim", 3, 3, W - 6, H - 6, Color3.new(1, 1, 1), 30, 1)
+stroke(rim, 0.58, Color3.new(1, 1, 1))
+UI.rim = rim
+UI.railDrag = button(UI.shell, "", 0, 0, 600, 78)
+UI.railDrag.BackgroundTransparency = 1
+text(UI.railDrag, "AURORA", 30, 18, 240, 32, 24, C.white, true)
+text(UI.railDrag, "L I Q U I D   S P A C E", 32, 51, 300, 15, 9, C.muted)
+UI.timeText = text(UI.shell, os.date("%H:%M"), 642, 24, 100, 28, 14, C.muted)
+UI.timeText.TextXAlignment = Enum.TextXAlignment.Right
+UI.minimize = button(UI.shell, "−", 756, 23, 42, 34)
+UI.close = button(UI.shell, "×", 810, 23, 42, 34)
+UI.header = button(UI.shell, "", 0, 79, W, 54)
+UI.header.BackgroundTransparency = 1
+local names = { "概览", "生命", "雪景", "外观", "音乐" }
+local subtitles = { "YOUR SPACE, AT A GLANCE", "VITALS / LIVE", "SLOW SNOWFALL", "MAKE IT YOURS", "NETEASE / MUSIC" }
+UI.pageTitle = text(UI.header, names[1], 30, 4, 360, 30, 23, C.white, true)
+UI.pageSubtitle = text(UI.header, subtitles[1], 412, 9, 440, 23, 9, C.muted)
+UI.pageSubtitle.TextXAlignment = Enum.TextXAlignment.Right
+UI.pageHost = make("ScrollingFrame", {
+    Name = "Pages", Position = UDim2.fromOffset(30, 141), Size = UDim2.fromOffset(824, 424),
+    BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 424),
+    ScrollBarThickness = 3, ScrollBarImageColor3 = C.accent,
+    ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true,
+}, UI.shell)
+for index = 1, 5 do
+    pages[index] = make("CanvasGroup", {
+        Name = "Page" .. index, Size = UDim2.fromOffset(824, 424), BackgroundTransparency = 1,
+        GroupTransparency = index == 1 and 0 or 1, Visible = index == 1,
+    }, UI.pageHost)
+end
+UI.sidebar = frame(UI.shell, "VerticalSidebar", 0, 79, 166, H - 79, C.ink, 0, 0.22)
+frame(UI.sidebar, "SidebarLine", 165, 0, 1, 900, C.border, nil, 0.65)
+text(UI.sidebar, "功能列表", 22, 20, 130, 24, 12, C.muted)
+UI.navMarker = frame(UI.sidebar, "SelectionPill", 12, 59, 142, 46, C.card, 18, 0.1)
+for index, name in ipairs(names) do
+    local node = button(UI.sidebar, name, 12, 59 + (index - 1) * 57, 142, 46)
+    node.Name = "Navigation" .. index
+    node.BackgroundTransparency = 1
+    node.TextSize = 16
+    nav[index] = { node = node }
+    bind(node.Activated, function() setPage(index) end)
+end
+UI.contentScale = make("UIScale", { Scale = 0.8 }, UI.pageHost)
+UI.header.Position = UDim2.fromOffset(166, 79)
+UI.header.Size = UDim2.fromOffset(718, 54)
+UI.pageTitle.Size = UDim2.fromOffset(280, 30)
+UI.pageSubtitle.Position = UDim2.fromOffset(306, 9)
+UI.pageSubtitle.Size = UDim2.fromOffset(386, 23)
+UI.fps = text(UI.shell, "LIVE", 30, 0, 150, 20, 9, C.muted)
+UI.fps.Position = UDim2.new(0, 30, 1, -33)
+UI.footer = text(UI.shell, "", 0, 0, 1, 1, 8, C.muted)
+
+
+local scene = {}
+do
+    local hero = card(pages[1], "SculptureCard", 30, 0, 324, 414)
+    gradient(hero, Color3.new(1, 1, 1), Color3.fromRGB(218, 218, 225), 55)
+    text(hero, "空间视角", 24, 17, 280, 29, 21, C.white, true)
+    text(hero, "跟随指针，轻轻浮动", 25, 51, 290, 22, 13, C.muted)
+    local viewport = make("ViewportFrame", {
+        Name = "OrbitalSculpture", Position = UDim2.fromOffset(18, 110), Size = UDim2.fromOffset(288, 230),
+        BackgroundTransparency = 1, Ambient = Color3.fromRGB(156, 184, 218),
+        LightColor = Color3.fromRGB(220, 239, 255), LightDirection = Vector3.new(-1, -1, -2),
+    }, hero)
+    scene.viewport = viewport
+    scene.camera = make("Camera", { FieldOfView = 36,
+        CFrame = CFrame.lookAt(Vector3.new(0, 0.8, 10.2), Vector3.zero) }, viewport)
+    viewport.CurrentCamera = scene.camera
+    local world = make("WorldModel", {}, viewport)
+    scene.model = make("Model", { Name = "Orbit" }, world)
+    local function part(name, size, color, cf, shape, material)
+        return make("Part", {
+            Name = name, Size = size, Color = color, CFrame = cf, Anchored = true,
+            CanCollide = false, CanTouch = false, CanQuery = false, CastShadow = false,
+            Shape = shape or Enum.PartType.Block, Material = material or Enum.Material.SmoothPlastic,
+        }, scene.model)
+    end
+    part("PearlCore", Vector3.new(2.15, 2.15, 2.15), Color3.fromRGB(227, 240, 253), CFrame.new(), Enum.PartType.Ball)
+    for ring = 1, 2 do
+        local basis = CFrame.Angles(math.rad(ring == 1 and 58 or -47), math.rad(ring * 26), math.rad(14))
+        for i = 1, 32 do
+            local angle = i / 32 * math.pi * 2
+            part("OrbitSegment", Vector3.new(0.09, 0.09, 0.41), ring == 1 and C.accent or C.white,
+                basis * CFrame.new(math.cos(angle) * 2.05, math.sin(angle) * 2.05, 0) * CFrame.Angles(0, math.pi / 2, angle),
+                nil, Enum.Material.Metal)
+        end
+    end
+    for i = 1, 3 do
+        local a = i / 3 * math.pi * 2
+        part("Satellite", Vector3.new(0.32, 0.32, 0.32), C.accent,
+            CFrame.new(math.cos(a) * 2.7, math.sin(a) * 1.5, math.sin(a) * 0.8), Enum.PartType.Ball)
+    end
+    scene.pivot = scene.model:GetPivot()
+    local vitals = card(pages[1], "HealthSummary", 370, 0, 424, 190)
+    gradient(vitals, Color3.new(1, 1, 1), Color3.fromRGB(221, 221, 227), 12)
+    text(vitals, "当前生命", 26, 17, 260, 26, 16, C.muted)
+    UI.homeHealth = text(vitals, "—", 24, 51, 370, 51, 38, C.white, true)
+    UI.homeState = text(vitals, "正在连接角色", 25, 109, 370, 27, 16, C.green, true)
+    local track = frame(vitals, "Track", 25, 151, 374, 7, C.off, 7)
+    UI.homeFill = frame(track, "Fill", 0, 0, 0, 7, C.green, 7)
+    local vitalShortcut = button(vitals, "查看生命详情", 226, 111, 172, 27)
+    vitalShortcut.TextSize = 13
+    bind(vitalShortcut.Activated, function() setPage(2) end)
+    text(vitals, "受伤时顶部自动提醒", 25, 164, 370, 20, 11, C.muted)
+    local snowCard = card(pages[1], "AtmosphereSummary", 370, 206, 424, 208)
+    text(snowCard, "环境氛围", 24, 17, 320, 29, 21, C.white, true)
+    UI.snowTitle = text(snowCard, "一场慢雪", 24, 59, 320, 38, 28, C.white, true)
+    text(snowCard, "慢慢飘落，给屏幕一点呼吸感。", 25, 106, 324, 24, 14, C.muted)
+    local snowToggle = button(snowCard, "落雪已开启", 24, 151, 218, 35)
+    UI.quickSnow = snowToggle
+    bind(snowToggle.Activated, function()
+        state.snow = not state.snow
+        for _, refresh in ipairs(switches) do refresh() end
+    end)
+    local snowShortcut = button(snowCard, "调整雪景", 254, 154, 146, 28)
+    snowShortcut.BackgroundTransparency = 1
+    snowShortcut.TextColor3 = C.accent
+    snowShortcut.TextSize = 13
+    bind(snowShortcut.Activated, function() setPage(3) end)
+    local sceneShortcut = button(hero, "界面偏好  ›", 24, 365, 276, 29)
+    sceneShortcut.BackgroundTransparency = 1
+    sceneShortcut.TextColor3 = C.accent
+    sceneShortcut.TextSize = 13
+    bind(sceneShortcut.Activated, function() setPage(4) end)
+end
+
+do
+    local vitals = card(pages[2], "LiveHealth", 30, 0, 450, 308)
+    gradient(vitals, Color3.new(1, 1, 1), Color3.fromRGB(220, 220, 226), 90)
+    text(vitals, "实时生命", 26, 22, 398, 31, 23, C.white, true)
+    UI.healthValue = text(vitals, "—", 24, 77, 398, 77, 62, C.white, true)
+    UI.healthStatus = text(vitals, "等待角色", 26, 177, 398, 32, 22, C.muted, true)
+    local track = frame(vitals, "HealthTrack", 26, 234, 398, 10, C.card, 10)
+    UI.healthTrail = frame(track, "DamageTrail", 0, 0, 0, 10, C.red, 10)
+    UI.healthFill = frame(track, "HealthFill", 0, 0, 0, 10, C.green, 10)
+    UI.healthReadout = text(vitals, "正在连接角色", 27, 264, 398, 22, 14, C.muted)
+    local session = card(pages[2], "Session", 496, 0, 298, 308)
+    text(session, "本次统计", 24, 22, 250, 31, 23, C.white, true)
+    local titles = { "受伤次数", "累计损失", "单次最高" }
+    UI.stats = {}
+    for i, value in ipairs(titles) do
+        local y = 76 + (i - 1) * 74
+        text(session, value, 24, y, 144, 31, 15, C.muted)
+        UI.stats[i] = text(session, "0", 164, y, 110, 35, 28, C.white, true)
+        UI.stats[i].TextXAlignment = Enum.TextXAlignment.Right
+    end
+    UI.preview = button(pages[2], "预览掉血动效", 30, 326, 374, 48, true)
+    UI.resetStats = button(pages[2], "清空本次统计", 420, 326, 374, 48)
+    text(pages[2], "生命数值来自当前角色；预览只演示界面。", 34, 391, 752, 23, 14, C.muted)
+end
+
+do
+    local settings = card(pages[3], "SnowSettings", 30, 0, 764, 215)
+    text(settings, "环境", 24, 12, 680, 30, 19, C.icon, true)
+    switch(settings, "缓缓落雪", "轻轻飘过屏幕，收起后渐隐", 54,
+        function() return state.snow end, function(value) state.snow = value end)
+    choice(settings, "雪花密度", 121, { "轻盈", "适中", "丰盈" }, function() return state.density end,
+        function(value) state.density = value end)
+        local speed = card(pages[3], "SnowRhythm", 30, 229, 764, 185)
+    text(speed, "节奏", 24, 12, 680, 30, 19, C.icon, true)
+    choice(speed, "飘落速度", 54, { "慢悠悠", "轻缓", "随风" }, function() return state.snowSpeed end,
+        function(value) state.snowSpeed = value end)
+    text(speed, "不同大小与轨迹，自然错落。", 24, 149, 690, 23, 13, C.muted)
+end
+
+do
+    local settings = card(pages[4], "InterfaceSettings", 30, 0, 764, 258)
+    text(settings, "交互", 24, 10, 690, 30, 19, C.icon, true)
+    switch(settings, "立体视差", "指针移动时，界面轻柔跟随", 46,
+        function() return state.depth end, function(value) state.depth = value end)
+    switch(settings, "果冻动画", "柔软形变与弹性回弹", 116,
+        function() return state.motion end, function(value) state.motion = value end)
+    switch(settings, "受伤提醒", "顶部展开提示，合并连续伤害", 186,
+        function() return state.alerts end, function(value)
+            state.alerts = value
+            if not value and not island.demo then island.deadline = 0 end
+        end)
+    local layout = card(pages[4], "LayoutSettings", 30, 272, 764, 142)
+    choice(layout, "界面尺寸", 12, { "舒适", "宽阔", "沉浸" }, function()
+        return state.scale == 0.9 and 1 or state.scale == 1 and 2 or 3
+    end, function(value)
+        state.scale = ({ 0.9, 1, 1.1 })[value]
+        fit()
+    end)
+    text(layout, "拖动顶栏移动窗口", 24, 106, 450, 24, 13, C.muted)
+    UI.resetLayout = button(layout, "重置位置", 542, 102, 198, 29)
+end
+
+UI.islandRoot = frame(UI.screen, "IslandAnchor", 0, Config.IslandTop, 350, 116, C.ink, nil, 1)
+UI.islandRoot.AnchorPoint = Vector2.new(0.5, 0)
+UI.islandRoot.Position = UDim2.new(0.5, 0, 0, Config.IslandTop)
+UI.islandRoot.ZIndex = 20
+UI.islandScale = make("UIScale", { Scale = 1 }, UI.islandRoot)
+UI.island = round(make("CanvasGroup", {
+    Name = "DynamicIsland", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromOffset(175, 0),
+    Size = UDim2.fromOffset(202, 42), BackgroundColor3 = Color3.new(0, 0, 0),
+    BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 2,
+}, UI.islandRoot), 25)
+UI.islandStroke = stroke(UI.island, 1, Color3.new(0, 0, 0))
+UI.islandJelly = make("NumberValue", { Value = 0 }, UI.gui)
+UI.islandWidth = make("NumberValue", { Value = 202 }, UI.gui)
+UI.islandHeight = make("NumberValue", { Value = 42 }, UI.gui)
+local islandExpanded = false
+local islandView = "idle"
+local islandVelocity = 0
+local islandGeometry = { width = 202, height = 42 }
+local function impulse(windowAmount, islandAmount)
+    if not state.motion then return end
+    islandVelocity = math.clamp(islandVelocity + (islandAmount or 0), -3, 3)
+end
+UI.idle = make("CanvasGroup", { Size = UDim2.fromOffset(202, 42), BackgroundTransparency = 1 }, UI.island)
+UI.idleDot = frame(UI.idle, "StatusDot", 16, 17, 8, 8, C.islandGreen, 8)
+text(UI.idle, "AURORA", 35, 0, 77, 42, 11, C.islandText, true)
+UI.idleHealth = text(UI.idle, "连接中", 117, 0, 68, 42, 11, C.islandText)
+UI.idleHealth.TextXAlignment = Enum.TextXAlignment.Right
+UI.alert = make("CanvasGroup", {
+    Position = UDim2.fromOffset(0, 0), Size = UDim2.fromOffset(344, 108),
+    BackgroundTransparency = 1, GroupTransparency = 1, Visible = false,
+}, UI.island)
+UI.alertBadge = frame(UI.alert, "Badge", 17, 17, 38, 38, C.islandRed, 13, 0.86)
+UI.alertIcon = text(UI.alertBadge, "HP", 0, 0, 38, 38, 12, C.islandRed, true)
+UI.alertIcon.TextXAlignment = Enum.TextXAlignment.Center
+UI.alertTitle = text(UI.alert, "受到伤害", 67, 14, 170, 24, 15, C.islandText, true)
+UI.alertDetail = text(UI.alert, "生命变化", 68, 39, 174, 18, 11, C.islandMuted)
+UI.alertValue = text(UI.alert, "−20", 239, 16, 84, 35, 24, C.islandRed, true)
+UI.alertValue.TextXAlignment = Enum.TextXAlignment.Right
+local islandTrack = frame(UI.alert, "IslandHealthTrack", 19, 72, 306, 5, Color3.fromRGB(39, 39, 42), 6)
+UI.islandTrail = frame(islandTrack, "Trail", 0, 0, 0, 5, C.islandRed, 6)
+UI.islandFill = frame(islandTrack, "Fill", 0, 0, 0, 5, C.islandGreen, 6)
+UI.alertFooter = text(UI.alert, "实时生命监测", 20, 85, 304, 16, 9, C.islandMuted)
+UI.islandHit = make("TextButton", {
+    Name = "ToggleWindow", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+    Text = "", AutoButtonColor = false, ZIndex = 10,
+}, UI.island)
+
+UI.musicRoot = frame(UI.screen, "DetachedMusicRoot", 0, 0, 360, 620, C.panel, nil, 1)
+UI.musicRoot.AnchorPoint = Vector2.new(0.5, 0.5)
+UI.musicRoot.ZIndex = 6
+UI.musicScale = make("UIScale", { Scale = 1 }, UI.musicRoot)
+UI.musicPresence = make("NumberValue", { Value = 1 }, UI.gui)
+UI.musicPanel = round(make("CanvasGroup", {
+    Name = "DetachedMusicSidebar", Size = UDim2.fromScale(1, 1), BackgroundColor3 = C.panel,
+    BackgroundTransparency = 0.08, BorderSizePixel = 0, ClipsDescendants = true,
+}, UI.musicRoot), 28)
+themed(UI.musicPanel, "BackgroundColor3", "panel")
+stroke(UI.musicPanel, 0.3, C.border)
+text(UI.musicPanel, "网易云音乐", 22, 16, 250, 30, 21, C.white, true)
+UI.hideMusic = button(UI.musicPanel, "×", 306, 16, 32, 30)
+local musicBody = make("ScrollingFrame", {
+    Name = "MusicSidebarContent", Position = UDim2.fromOffset(0, 58), Size = UDim2.new(1, 0, 1, -68),
+    BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 804),
+    ScrollBarThickness = 3, ScrollBarImageColor3 = C.muted,
+}, UI.musicPanel)
+local musicPage = card(pages[5], "MusicWorkspace", 30, 0, 764, 414)
+text(musicPage, "右侧音乐工作区", 28, 28, 700, 40, 28, C.white, true)
+text(musicPage, "搜索、封面和播放控制位于独立音乐侧栏。", 28, 87, 700, 28, 17, C.muted)
+UI.showMusic = button(musicPage, "打开音乐侧栏", 28, 153, 708, 48, true)
+text(musicPage, "收起主窗时，两个窗口一起缩向顶部灵动岛。", 28, 252, 700, 28, 15, C.muted)
+M.env = _G
+pcall(function() M.env = getgenv() end)
+M.request = M.env.request or M.env.http_request or request or http_request
+if not M.request and type(M.env.syn) == "table" then M.request = M.env.syn.request end
+M.write = M.env.writefile or writefile
+M.asset = M.env.getcustomasset or M.env.getsynasset or getcustomasset or getsynasset
+M.mkdir = M.env.makefolder or makefolder
+M.isdir = M.env.isfolder or isfolder
+M.resultConnections = {}
+M.sound = make("Sound", { Name = "AuroraMusic", Volume = Config.Volume }, SoundService)
+M.http = function(url, method, payload)
+    if not alive then error("界面已关闭", 0) end
+    if type(M.request) == "function" then
+        local response = M.request({ Url = url, Method = method or "GET", Body = payload,
+            Headers = { Referer = "https://music.163.com/", ["User-Agent"] = "Mozilla/5.0",
+                ["Content-Type"] = "application/x-www-form-urlencoded" } })
+        local status = type(response) == "table" and tonumber(response.StatusCode or response.Status)
+        local body = type(response) == "table" and (response.Body or response.body)
+        if status and (status < 200 or status >= 300) then error("HTTP " .. status, 0) end
+        if type(body) == "string" and #body > 0 then return body end
+        error("请求未返回有效内容", 0)
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok and type(body) == "string" and #body > 0 then return body end
+    error("当前运行环境未提供 HTTP 请求能力", 0)
+end
+M.json = function(path, method, payload)
+    local body = M.http(Config.MusicApi .. path, method, payload)
+    local data = HttpService:JSONDecode(body)
+    if type(data) ~= "table" or data.code and tonumber(data.code) ~= 200 then error("网易云接口暂不可用", 0) end
+    return data
+end
+M.save = function(name, bytes)
+    if type(M.write) ~= "function" or type(M.asset) ~= "function" then
+        error("播放需要运行环境支持 writefile 和 getcustomasset", 0)
+    end
+    if M.folder == nil then
+        M.folder = ""
+        if type(M.mkdir) == "function" then
+            local ok = pcall(M.mkdir, Config.MusicCache)
+            if ok or type(M.isdir) == "function" and M.isdir(Config.MusicCache) then M.folder = Config.MusicCache .. "/" end
+        end
+    end
+    local path = M.folder .. "aurora-" .. name
+    M.write(path, bytes)
+    return M.asset(path)
+end
+M.normalize = function(song)
+    local artists = {}
+    for _, artist in ipairs(song.ar or song.artists or {}) do artists[#artists + 1] = artist.name or "" end
+    local album = song.al or song.album or {}
+    return { id = tostring(song.id), name = song.name or "未命名歌曲", artist = table.concat(artists, " / "),
+        cover = album.picUrl or album.blurPicUrl, duration = (song.dt or song.duration or 0) / 1000 }
+end
+M.time = function(value)
+    value = math.max(0, math.floor(value or 0))
+    return string.format("%d:%02d", math.floor(value / 60), value % 60)
+end
+do
+    local library = card(musicBody, "MusicLibrary", 0, 0, 360, 360)
+    text(library, "网易云音乐", 22, 16, 380, 32, 24, C.white, true)
+    M.input = round(make("TextBox", {
+        Name = "MusicQuery", Position = UDim2.fromOffset(22, 63), Size = UDim2.fromOffset(222, 40),
+        BackgroundColor3 = C.card, BorderSizePixel = 0, Text = "", PlaceholderText = "歌名 / 歌手 / 歌曲链接",
+        TextColor3 = C.white, PlaceholderColor3 = C.muted, TextSize = 16,
+        Font = Enum.Font.GothamMedium, ClearTextOnFocus = false,
+    }, library), 12)
+    themed(M.input, "BackgroundColor3", "card")
+    themed(M.input, "TextColor3", "white")
+    themed(M.input, "PlaceholderColor3", "muted")
+    M.searchButton = button(library, "搜索", 254, 63, 84, 40, true)
+    M.searchButton.TextSize = 14
+    M.results = make("ScrollingFrame", {
+        Name = "MusicResults", Position = UDim2.fromOffset(18, 117), Size = UDim2.fromOffset(324, 184),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+        ScrollBarImageColor3 = C.accent, CanvasSize = UDim2.fromOffset(0, 0),
+    }, library)
+    M.searchStatus = text(library, "搜索后点选歌曲播放", 22, 312, 316, 30, 12, C.muted)
+    M.searchStatus.TextWrapped = true
+    local playerCard = card(musicBody, "MusicPlayer", 18, 380, 324, 414)
+    M.cover = round(make("ImageLabel", {
+        Name = "MusicCover", Position = UDim2.fromOffset(24, 20), Size = UDim2.fromOffset(112, 112),
+        Image = "", BackgroundColor3 = C.card, BorderSizePixel = 0,
+        ScaleType = Enum.ScaleType.Crop,
+    }, playerCard), 18)
+    themed(M.cover, "BackgroundColor3", "card")
+    text(playerCard, "NOW\nPLAYING", 156, 37, 148, 62, 19, C.accent, true).TextWrapped = true
+    M.title = text(playerCard, "选择一首喜欢的歌", 24, 148, 276, 31, 20, C.white, true)
+    M.artist = text(playerCard, "网易云音乐", 24, 183, 276, 23, 13, C.muted)
+    M.status = text(playerCard, "等待播放", 24, 211, 276, 30, 12, C.muted)
+    M.status.TextWrapped = true
+    M.seek = button(playerCard, "", 24, 250, 276, 18)
+    M.seek.BackgroundTransparency = 1
+    frame(M.seek, "SeekTrack", 0, 7, 276, 4, C.card, 4)
+    M.seekFill = frame(M.seek, "SeekFill", 0, 7, 0, 4, C.accent, 4)
+    M.timeLabel = text(playerCard, "0:00 / 0:00", 24, 273, 276, 20, 12, C.muted)
+    M.back = button(playerCard, "上一首", 24, 304, 82, 38)
+    M.play = button(playerCard, "播放", 117, 304, 90, 38, true)
+    M.next = button(playerCard, "下一首", 218, 304, 82, 38)
+    M.back.TextSize, M.next.TextSize = 12, 12
+    M.volume = button(playerCard, "音量 55%", 24, 359, 134, 30)
+    M.volume.TextSize = 12
+    M.loop = button(playerCard, "循环：关", 168, 359, 132, 30)
+    M.loop.TextSize = 12
+    M.stopButton = button(playerCard, "关闭音乐", 214, 21, 86, 28)
+    M.stopButton.TextSize = 12
+end
+M.capsule = make("CanvasGroup", {
+    Name = "NowPlayingIsland", BackgroundTransparency = 1, Size = UDim2.fromOffset(292, 54),
+    GroupTransparency = 1, Visible = false,
+}, UI.island)
+M.presence = make("NumberValue", { Value = 0 }, UI.gui)
+M.miniCover = round(make("ImageLabel", {
+    Position = UDim2.fromOffset(11, 10), Size = UDim2.fromOffset(34, 34), Image = "",
+    BorderSizePixel = 0, BackgroundColor3 = Color3.fromRGB(40, 44, 55), ScaleType = Enum.ScaleType.Crop,
+}, M.capsule), 9)
+M.miniTitle = text(M.capsule, "", 55, 7, 130, 21, 12, C.islandText, true)
+M.miniArtist = text(M.capsule, "", 55, 29, 130, 16, 9, C.islandMuted)
+M.bars = {}
+for i = 1, 4 do
+    local bar = frame(M.capsule, "AudioBar", 191 + (i - 1) * 5, 35, 2, 4, C.islandGreen, 2)
+    bar.AnchorPoint = Vector2.new(0.5, 1)
+    M.bars[i] = bar
+end
+M.capsulePlay = round(make("TextButton", {
+    Name = "IslandMusicPlay", Position = UDim2.fromOffset(217, 10), Size = UDim2.fromOffset(34, 34),
+    BackgroundColor3 = Color3.fromRGB(35, 35, 38), BorderSizePixel = 0, AutoButtonColor = false,
+    Text = "II", TextSize = 14, Font = Enum.Font.GothamBold, TextColor3 = C.islandText,
+    Visible = false, ZIndex = 12,
+}, UI.island), 17)
+M.capsuleStop = round(make("TextButton", {
+    Name = "IslandMusicStop", Position = UDim2.fromOffset(256, 10), Size = UDim2.fromOffset(28, 34),
+    BackgroundTransparency = 1, Text = "×", TextSize = 18, TextColor3 = C.islandMuted,
+    Font = Enum.Font.GothamMedium, AutoButtonColor = false, Visible = false, ZIndex = 12,
+}, UI.island), 14)
+M.detail = make("CanvasGroup", {
+    Name = "IslandMusicDetail", Size = UDim2.fromOffset(344, 184), BackgroundTransparency = 1,
+    GroupTransparency = 1, Visible = false,
+}, UI.island)
+M.detailCover = round(make("ImageLabel", {
+    Name = "IslandDetailCover", Position = UDim2.fromOffset(18, 18), Size = UDim2.fromOffset(56, 56),
+    Image = "", BackgroundColor3 = Color3.fromRGB(38, 38, 42), BorderSizePixel = 0,
+    ScaleType = Enum.ScaleType.Crop,
+}, M.detail), 12)
+M.detailTitle = text(M.detail, "", 88, 19, 236, 27, 17, C.islandText, true)
+M.detailArtist = text(M.detail, "", 88, 48, 236, 23, 14, C.islandMuted)
+local detailTrack = frame(M.detail, "DetailTrack", 20, 91, 304, 4, Color3.fromRGB(50, 50, 54), 4)
+M.detailFill = frame(detailTrack, "DetailFill", 0, 0, 0, 4, C.islandText, 4)
+M.detailTime = text(M.detail, "0:00 / 0:00", 20, 99, 304, 20, 12, C.islandMuted)
+local function detailButton(name, value, x, width)
+    return round(make("TextButton", {
+        Name = name, Text = value, Position = UDim2.fromOffset(x, 131), Size = UDim2.fromOffset(width, 34),
+        BackgroundColor3 = Color3.fromRGB(38, 38, 42), TextColor3 = C.islandText,
+        TextSize = 14, Font = Enum.Font.GothamBold, AutoButtonColor = false, BorderSizePixel = 0,
+        ZIndex = 12, Interactable = false,
+    }, M.detail), 12)
+end
+M.detailPrevious = detailButton("IslandPrevious", "上一首", 18, 66)
+M.detailPlay = detailButton("IslandDetailPlay", "播放", 91, 66)
+M.detailNext = detailButton("IslandNext", "下一首", 164, 66)
+M.detailOpen = detailButton("IslandOpenPlayer", "播放器", 237, 89)
+
+M.stop = function()
+    M.version = M.version + 1
+    M.loading, M.loaded, M.playing, M.wants, M.ended = false, false, false, false, false
+    M.expanded = false
+    M.sound:Stop()
+    M.status.Text = "音乐已关闭"
+    M.seekFill.Size = UDim2.fromOffset(0, 4)
+    M.timeLabel.Text = "0:00 / 0:00"
+    M.update()
+end
+M.update = function()
+    M.playing = M.loaded and M.sound.IsPlaying
+    M.play.Text = M.playing and "暂停" or "播放"
+    M.capsulePlay.Text = M.playing and "II" or "▷"
+    M.miniTitle.Text = M.name or ""
+    M.detailTitle.Text = M.name or ""
+    M.detailArtist.Text = M.artistName or ""
+    M.detailPlay.Text = M.playing and "暂停" or "播放"
+    M.miniArtist.Text = M.playing and (M.artistName or "网易云音乐") or "已暂停"
+    syncIsland()
+end
+M.playSong = function(song, index)
+    M.version = M.version + 1
+    local version = M.version
+    M.index = index or M.index
+    M.loading, M.loaded, M.wants, M.ended = true, false, true, false
+    M.sound:Stop()
+    M.name, M.artistName, M.duration = song.name, song.artist, song.duration or 0
+    M.title.Text, M.artist.Text, M.status.Text = M.name, M.artistName, "正在准备歌曲…"
+    M.expanded = false
+    M.cover.Image, M.miniCover.Image, M.detailCover.Image = "", "", ""
+    M.update()
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if type(M.write) ~= "function" or type(M.asset) ~= "function" then error("播放需要 writefile 与 getcustomasset 支持", 0) end
+            local detail = M.json("/api/song/detail/?id=" .. song.id .. "&ids=%5B" .. song.id .. "%5D")
+            if not alive or version ~= M.version then return end
+            if detail.songs and detail.songs[1] then song = M.normalize(detail.songs[1]) end
+            M.name, M.artistName, M.duration = song.name, song.artist, song.duration
+            M.title.Text, M.artist.Text = song.name, song.artist
+            M.status.Text = "正在获取可播放音源…"
+            local asset = M.cache[song.id]
+            if not asset then
+                local data = M.json("/api/song/enhance/player/url?ids=%5B" .. song.id .. "%5D&br=128000")
+                if not alive or version ~= M.version then return end
+                local entry = data.data and data.data[1]
+                local url = entry and entry.url
+                if type(url) ~= "string" or url == "" then url = "https://music.163.com/song/media/outer/url?id=" .. song.id .. ".mp3" end
+                local bytes = M.http(url:gsub("^http:", "https:"))
+                if not alive or version ~= M.version then return end
+                local a, b = bytes:byte(1, 2)
+                if #bytes < 1024 or not (bytes:sub(1, 3) == "ID3" or a == 255 and b and b >= 224) then
+                    error("该歌曲暂未提供可播放的 MP3 音源", 0)
+                end
+                asset = M.save("song-" .. song.id .. ".mp3", bytes)
+                M.cache[song.id] = asset
+            end
+            if not alive or version ~= M.version then return end
+            M.sound.SoundId = asset
+            local deadline = os.clock() + 15
+            while alive and version == M.version and not M.sound.IsLoaded and os.clock() < deadline do task.wait(0.1) end
+            if not alive or version ~= M.version then return end
+            if not M.sound.IsLoaded then error("本地音频载入超时", 0) end
+            M.loading, M.loaded = false, true
+            M.sound:Play()
+            if not M.wants then M.sound:Pause() end
+            M.status.Text = M.wants and "正在播放" or "已暂停"
+            M.update()
+            if song.cover then
+                task.spawn(function()
+                    local success, cover = pcall(function()
+                        local bytes = M.http(song.cover:gsub("^http:", "https:") .. (song.cover:find("?", 1, true) and "&" or "?") .. "param=256y256")
+                        if not alive or version ~= M.version then return end
+                        local extension = bytes:sub(1, 8) == "\137PNG\13\10\26\10" and "png" or bytes:sub(1, 2) == "\255\216" and "jpg"
+                        if not extension then return end
+                        return M.save("cover-" .. song.id .. "." .. extension, bytes)
+                    end)
+                    if alive and version == M.version and success and cover then M.cover.Image, M.miniCover.Image, M.detailCover.Image = cover, cover, cover end
+                end)
+            end
+        end)
+        if alive and version == M.version and not ok then
+            M.loading, M.loaded = false, false
+            M.status.Text = tostring(err)
+            M.update()
+        end
+    end)
+end
+M.search = function()
+    local query = M.input.Text:match("^%s*(.-)%s*$")
+    if query == "" then M.searchStatus.Text = "请输入歌名、歌手或歌曲链接"; return end
+    M.searchVersion = M.searchVersion + 1
+    local version = M.searchVersion
+    local id = query:match("^%d+$") or query:match("[?&]id=(%d+)") or query:match("/song/(%d+)")
+    if id then
+        M.searchButton.Text = "搜索"
+        M.queue = { { id = id, name = "网易云 / " .. id, artist = "", duration = 0 } }
+        M.playSong(M.queue[1], 1)
+        return
+    end
+    M.searchButton.Text, M.searchStatus.Text = "搜索中", "正在搜索网易云…"
+    task.spawn(function()
+        local ok, songs = pcall(function()
+            local params = "s=" .. HttpService:UrlEncode(query) .. "&type=1&limit=20&offset=0"
+            local lastError
+            for _, path in ipairs({ "/api/search/get?", "/api/cloudsearch/pc?", "/api/search/get/web?" }) do
+                local success, data = pcall(M.json, path .. params)
+                if not alive or version ~= M.searchVersion then return {} end
+                if success and data.result and type(data.result.songs) == "table" then
+                    local result = {}
+                    for _, item in ipairs(data.result.songs) do result[#result + 1] = M.normalize(item) end
+                    return result
+                end
+                lastError = success and "没有匹配歌曲" or tostring(data)
+            end
+            error(lastError, 0)
+        end)
+        if not alive or version ~= M.searchVersion then return end
+        M.searchButton.Text = "搜索"
+        if not ok then M.searchStatus.Text = "搜索失败：" .. tostring(songs); return end
+        disconnect(M.resultConnections)
+        for _, child in ipairs(M.results:GetChildren()) do child:Destroy() end
+        M.queue, M.index = songs, 0
+        M.results.CanvasSize = UDim2.fromOffset(0, #songs * 60)
+        for index, song in ipairs(songs) do
+            local row = round(make("TextButton", {
+                Position = UDim2.fromOffset(0, (index - 1) * 60), Size = UDim2.fromOffset(316, 54),
+                BackgroundColor3 = C.card, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+                Interactable = state.open and state.musicVisible,
+            }, M.results), 12)
+            themed(row, "BackgroundColor3", "card")
+            text(row, song.name, 13, 5, 290, 25, 14, C.white, true)
+            text(row, song.artist, 13, 31, 290, 18, 11, C.muted)
+            bind(row.Activated, function()
+                M.queue = songs
+                M.playSong(song, index)
+            end, M.resultConnections)
+        end
+        M.searchStatus.Text = #songs > 0 and ("找到 " .. #songs .. " 首歌曲，点选播放") or "没有找到歌曲"
+    end)
+end
+M.toggle = function()
+    if M.loading then M.wants = not M.wants; M.status.Text = M.wants and "载入后播放" or "载入后暂停"; return end
+    if not M.loaded then M.search(); return end
+    if M.sound.IsPlaying then M.sound:Pause(); M.status.Text = "已暂停"
+    else
+        if M.ended then M.sound:Play(); M.ended = false else M.sound:Resume() end
+        M.status.Text = "正在播放"
+    end
+    M.update()
+end
+M.step = function(delta)
+    if #M.queue == 0 then M.searchStatus.Text = "先搜索并选择歌曲"; return end
+    local index = ((math.max(1, M.index) - 1 + delta) % #M.queue) + 1
+    M.playSong(M.queue[index], index)
+end
+bind(M.searchButton.Activated, M.search)
+bind(M.input.FocusLost, function(enter) if enter then M.search() end end)
+bind(M.play.Activated, M.toggle)
+bind(M.detailPrevious.Activated, function() M.step(-1) end)
+bind(M.detailPlay.Activated, M.toggle)
+bind(M.detailNext.Activated, function() M.step(1) end)
+bind(M.detailOpen.Activated, function()
+    setOpen(true)
+    setMusicVisible(true)
+    setPage(5)
+    M.expanded = false
+    syncIsland()
+end)
+bind(M.capsulePlay.Activated, M.toggle)
+bind(M.capsuleStop.Activated, M.stop)
+bind(M.stopButton.Activated, M.stop)
+bind(M.back.Activated, function() M.step(-1) end)
+bind(M.next.Activated, function() M.step(1) end)
+bind(M.volume.Activated, function()
+    M.sound.Volume = M.sound.Volume >= 0.99 and 0 or math.min(1, M.sound.Volume + 0.15)
+    M.volume.Text = "音量 " .. math.floor(M.sound.Volume * 100 + 0.5) .. "%"
+end)
+bind(M.loop.Activated, function()
+    M.sound.Looped = not M.sound.Looped
+    M.loop.Text = M.sound.Looped and "循环：开" or "循环：关"
+end)
+bind(M.seek.InputBegan, function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if M.loaded and M.sound.TimeLength > 0 then
+        M.sound.TimePosition = math.clamp((input.Position.X - M.seek.AbsolutePosition.X) / math.max(1, M.seek.AbsoluteSize.X), 0, 1) * math.max(0, M.sound.TimeLength - 0.05)
+    end
+end)
+bind(M.sound.Ended, function()
+    if not alive or not M.loaded or M.sound.Looped then return end
+    if #M.queue > 1 then M.step(1) else M.ended = true; M.status.Text = "播放结束"; M.update() end
+end)
+M.tick = function(_, phase)
+    local presence = M.presence.Value
+    M.miniCover.Size = UDim2.fromOffset(34 * (0.25 + presence * 0.75), 34 * (0.25 + presence * 0.75))
+    M.miniCover.Position = UDim2.fromOffset(11 + (1 - presence) * 12, 10 + (1 - presence) * 12)
+    M.miniCover.ImageTransparency = 1 - presence
+    for index, bar in ipairs(M.bars) do
+        local height = M.playing and state.motion and (5 + (math.sin(phase * 4 + index * 1.6) + 1) * 5 + math.min(M.sound.PlaybackLoudness / 180, 6)) or 4
+        bar.Size = UDim2.fromOffset(2, math.max(1, height * presence))
+        bar.BackgroundTransparency = 1 - presence
+    end
+    if not M.loaded then return end
+    if M.playing ~= M.sound.IsPlaying then M.update() end
+    local duration = M.sound.TimeLength > 0 and M.sound.TimeLength or M.duration or 0
+    local position = M.sound.TimePosition
+    M.seekFill.Size = UDim2.fromOffset(duration > 0 and 276 * math.clamp(position / duration, 0, 1) or 0, 4)
+    M.timeLabel.Text = M.time(position) .. " / " .. M.time(duration)
+    M.detailTime.Text = M.timeLabel.Text
+    M.detailFill.Size = UDim2.fromScale(duration > 0 and math.clamp(position / duration, 0, 1) or 0, 1)
+
+end
+
+local function number(value)
+    if math.abs(value - math.floor(value + 0.5)) < 0.05 then return tostring(math.floor(value + 0.5)) end
+    return string.format("%.1f", value)
+end
+local function healthColor(ratio)
+    return ratio <= 0.25 and C.red or ratio <= 0.5 and C.accent or C.green
+end
+local function updateStats()
+    UI.stats[1].Text = tostring(health.hits)
+    UI.stats[2].Text = number(health.total)
+    UI.stats[3].Text = number(health.peak)
+end
+local function refreshHealth(immediate)
+    local ratio = health.bound and math.clamp(health.current / math.max(health.maximum, 1), 0, 1) or 0
+    local color = healthColor(ratio)
+    local duration = immediate and 0.01 or 0.28
+    UI.homeHealth.Text = health.bound and (number(health.current) .. " / " .. number(health.maximum)) or "—"
+    UI.healthValue.Text = health.bound and number(health.current) or "—"
+    UI.healthValue.TextColor3 = health.bound and color or C.white
+    local status = not health.bound and "等待角色" or health.current <= 0 and "已倒下" or ratio <= 0.25 and "生命垂危" or ratio <= 0.5 and "需要恢复" or "状态良好"
+    UI.homeState.Text = status
+    UI.healthStatus.Text = status
+    UI.healthStatus.TextColor3 = health.bound and color or C.muted
+    UI.healthReadout.Text = health.bound and ("生命上限 " .. number(health.maximum) .. "  /  " .. math.floor(ratio * 100 + 0.5) .. "%") or "正在等待角色生命组件"
+    UI.idleHealth.Text = health.bound and (number(health.current) .. " HP") or "连接中"
+    UI.idleDot.BackgroundColor3 = health.bound and (ratio <= 0.25 and C.islandRed or C.islandGreen) or C.islandMuted
+    tween(UI.homeFill, { Size = UDim2.fromScale(ratio, 1), BackgroundColor3 = color }, duration)
+    tween(UI.healthFill, { Size = UDim2.fromScale(ratio, 1), BackgroundColor3 = color }, duration)
+    tween(UI.healthTrail, { Size = UDim2.fromScale(ratio, 1) }, immediate and 0.01 or 0.9)
+    if not island.demo then
+        tween(UI.islandFill, { Size = UDim2.fromScale(ratio, 1), BackgroundColor3 = ratio <= 0.25 and C.islandRed or C.islandGreen }, duration)
+        tween(UI.islandTrail, { Size = UDim2.fromScale(ratio, 1) }, immediate and 0.01 or 0.9)
+    end
+end
+syncIsland = function()
+    local view = island.deadline > os.clock() and "alert" or M.loaded and (M.expanded and "detail" or "music") or "idle"
+    islandExpanded = view == "alert"
+    if view == islandView then return end
+    islandView = view
+    impulse(0, view == "idle" and -0.45 or 0.8)
+    tween(UI.islandWidth, { Value = view == "alert" and 344 or view == "detail" and 344 or view == "music" and 292 or 202 }, 0.6, Enum.EasingStyle.Quint)
+    tween(UI.islandHeight, { Value = view == "alert" and 108 or view == "detail" and 184 or view == "music" and 54 or 42 }, 0.6, Enum.EasingStyle.Quint)
+    UI.alert.Visible = true
+    UI.idle.Visible = true
+    M.capsule.Visible = true
+    M.detail.Visible = true
+    tween(M.detail, { GroupTransparency = view == "detail" and 0 or 1 }, 0.28)
+    for _, node in ipairs(M.detail:GetDescendants()) do
+        if node:IsA("GuiButton") then node.Interactable = view == "detail" end
+    end
+    tween(UI.idle, { GroupTransparency = view == "idle" and 0 or 1 }, 0.18)
+    tween(UI.alert, { GroupTransparency = view == "alert" and 0 or 1 }, 0.22)
+    tween(M.capsule, { GroupTransparency = view == "music" and 0 or 1,
+        Position = UDim2.fromOffset(view == "music" and 0 or 18, 0) }, 0.32)
+    tween(M.presence, { Value = view == "music" and 1 or 0 }, 0.36, Enum.EasingStyle.Quint)
+    M.capsulePlay.Visible = view == "music"
+    M.capsuleStop.Visible = view == "music"
+    UI.islandHit.Size = view == "detail" and UDim2.new(1, 0, 0, 87) or view == "music" and UDim2.new(1, -80, 1, 0) or UDim2.fromScale(1, 1)
+end
+local function expandIsland(expanded)
+    if not expanded then island.deadline = 0 end
+    syncIsland()
+end
+notify = function(mode, damage, demo)
+    if not alive or (not state.alerts and not demo) then return end
+    demo = demo == true
+    local now = os.clock()
+    local merge = mode == "damage" and island.mode == "damage" and island.demo == demo and now - island.lastHit < 0.9
+    island.damage = merge and island.damage + damage or damage or 0
+    island.lastHit = now
+    island.mode, island.demo = mode, demo
+    island.deadline = now + (mode == "ready" and 2.0 or Config.DamageHold)
+    local ready = mode == "ready"
+    local color = ready and C.islandGreen or C.islandRed
+    UI.alertTitle.Text = demo and "受伤动效预览" or ready and "角色已就绪" or mode == "death" and "生命已耗尽" or "受到伤害"
+    UI.alertDetail.Text = demo and "生命 100 → 80 / 演示" or ("当前生命 " .. number(health.current) .. " / " .. number(health.maximum))
+    UI.alertValue.Text = ready and "LIVE" or ("−" .. number(island.damage))
+    UI.alertValue.TextColor3 = color
+    UI.alertValue.TextSize = ready and 17 or 24
+    UI.alertBadge.BackgroundColor3 = color
+    UI.alertIcon.TextColor3 = color
+    UI.alertIcon.Text = ready and "ON" or "HP"
+    UI.alertFooter.Text = demo and "预览结束后自动恢复实际生命值" or ready and "生命监测已连接 · 点击收起或展开界面" or mode == "death" and "等待角色重生后自动重新连接" or merge and "短时间连续伤害已合并显示" or "生命变化已记录 · 点击切换悬浮窗"
+    if demo then
+        UI.islandTrail.Size = UDim2.fromScale(1, 1)
+        UI.islandFill.Size = UDim2.fromScale(1, 1)
+        tween(UI.islandFill, { Size = UDim2.fromScale(0.8, 1), BackgroundColor3 = C.islandGreen }, 0.35)
+        tween(UI.islandTrail, { Size = UDim2.fromScale(0.8, 1) }, 1.1)
+    else
+        refreshHealth(false)
+    end
+    UI.alertValue.Position = UDim2.fromOffset(239, 10)
+    tween(UI.alertValue, { Position = UDim2.fromOffset(239, 16) }, 0.45, Enum.EasingStyle.Back)
+    expandIsland(true)
+end
+
+local function attachHumanoid(component)
+    if not alive or component == humanoid then return end
+    disconnect(humanoidConnections)
+    humanoid = component
+    health.bound = true
+    health.current, health.maximum = math.max(0, component.Health), component.MaxHealth
+    island.demo = false
+    refreshHealth(true)
+    notify("ready", 0, false)
+    bind(component.HealthChanged, function(value)
+        local before = health.current
+        health.current, health.maximum = math.max(0, value), component.MaxHealth
+        local damage = before - health.current
+        if damage > 0.001 then
+            health.hits = health.hits + 1
+            health.total = health.total + damage
+            health.peak = math.max(health.peak, damage)
+            updateStats()
+            notify(health.current <= 0 and "death" or "damage", damage, false)
+        end
+        refreshHealth(false)
+        if island.mode ~= "idle" and not island.demo then
+            UI.alertDetail.Text = "当前生命 " .. number(health.current) .. " / " .. number(health.maximum)
+        end
+    end, humanoidConnections)
+    bind(component:GetPropertyChangedSignal("MaxHealth"), function()
+        health.maximum = component.MaxHealth
+        refreshHealth(false)
+    end, humanoidConnections)
+end
+local function detachHumanoid()
+    disconnect(humanoidConnections)
+    humanoid = nil
+    health.bound = false
+    refreshHealth(true)
+end
+local function attachCharacter(model)
+    disconnect(characterConnections)
+    detachHumanoid()
+    character = model
+    local component = model:FindFirstChildOfClass("Humanoid")
+    if component then attachHumanoid(component) end
+    bind(model.ChildAdded, function(child)
+        if child:IsA("Humanoid") then attachHumanoid(child) end
+    end, characterConnections)
+    bind(model.ChildRemoved, function(child)
+        if child == humanoid then detachHumanoid() end
+    end, characterConnections)
+end
+
+local pageTicket, windowTicket = 0, 0
+setPage = function(index)
+    if not alive or index < 1 or index > #pages then return end
+    if state.page == index and UI.pageInitialized then
+        if index == 5 then setMusicVisible(true) end
+        return
+    end
+    local direction = index >= state.page and 1 or -1
+    state.page = index
+    UI.pageInitialized = true
+    pageTicket = pageTicket + 1
+    local ticket = pageTicket
+    UI.pageTitle.Text, UI.pageSubtitle.Text = names[index], subtitles[index]
+    tween(UI.navMarker, { Position = UDim2.fromOffset(12, 59 + (index - 1) * 57) }, 0.36)
+    for i, item in ipairs(nav) do
+        tween(item.node, { TextColor3 = i == index and C.accent or C.muted }, 0.24)
+    end
+    for i, page in ipairs(pages) do
+        for _, child in ipairs(page:GetDescendants()) do
+            if child:IsA("GuiButton") then child.Interactable = i == index end
+        end
+        page.ZIndex = i == index and 2 or 1
+        if i == index then
+            if not page.Visible then page.Position = UDim2.fromOffset(direction * 14, 0) end
+            page.Visible = true
+            tween(page, { GroupTransparency = 0, Position = UDim2.fromOffset(0, 0) }, 0.3)
+        elseif page.Visible then
+            tween(page, { GroupTransparency = 1, Position = UDim2.fromOffset(-direction * 8, 0) }, 0.2)
+        end
+    end
+    task.delay(state.motion and 0.32 or 0.02, function()
+        if not alive or ticket ~= pageTicket then return end
+        for i, page in ipairs(pages) do if i ~= index then page.Visible = false end end
+    end)
+    UI.pageHost.CanvasSize = UDim2.fromOffset(0, index == 4 and 487 or 424)
+    UI.pageHost.CanvasPosition = Vector2.zero
+    if index == 5 then setMusicVisible(true) end
+end
+setOpen = function(value)
+    if not alive or value == state.open then return end
+    state.open = value
+    musicInput(value and state.musicVisible)
+    windowTicket = windowTicket + 1
+    local ticket = windowTicket
+    UI.root.Visible = true
+    drag = nil
+    if value then
+        tween(UI.travel, { Value = 0 }, 0.62)
+        tween(UI.zoom, { Value = 1 }, 0.68, Enum.EasingStyle.Back)
+        tween(UI.progress, { Value = 1 }, 0.3)
+    else
+        tween(UI.zoom, { Value = 0.9 }, 0.14)
+        task.delay(state.motion and 0.14 or 0.01, function()
+            if not alive or ticket ~= windowTicket or state.open then return end
+            tween(UI.travel, { Value = 1 }, 0.46, Enum.EasingStyle.Quart)
+            tween(UI.zoom, { Value = 0.035 }, 0.46, Enum.EasingStyle.Quart)
+            tween(UI.progress, { Value = 0 }, 0.37)
+            task.delay(state.motion and 0.48 or 0.03, function()
+                if alive and ticket == windowTicket and not state.open then UI.root.Visible = false end
+            end)
+        end)
+    end
+end
+fit = function()
+    local size = UI.screen.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return end
+    UI.islandScale.Scale = math.max(0.1, math.min(Config.IslandScale, (size.X - 28) / 370, size.Y / 460))
+    local top = Config.IslandTop + 42 * UI.islandScale.Scale + 16
+    local available = math.max(150, size.Y - top - 12)
+    local width = math.min((size.X - 42) * W / (W + 360) * state.scale, available * 1.62)
+    fitScale = math.max(0.1, width / W)
+    H = math.clamp(available / fitScale, 430, 720)
+    UI.root.Size = UDim2.fromOffset(W, H)
+    UI.rim.Size = UDim2.fromOffset(W - 6, H - 6)
+    UI.sidebar.Size = UDim2.fromOffset(166, H - 79)
+    UI.pageHost.Size = UDim2.fromOffset(824, math.min(424, (H - 169) / 0.8))
+    UI.pageHost.Position = UDim2.fromOffset(195, 141)
+    UI.musicRoot.Size = UDim2.fromOffset(360, H)
+    local totalWidth = (W + 360) * fitScale + 18
+    local layoutLeft = (size.X - totalWidth) / 2
+    musicHomePosition = Vector2.new(layoutLeft + W * fitScale + 18 + 180 * fitScale, top + available / 2)
+    local halfX, halfY = W * fitScale / 2, H * fitScale / 2
+    local layoutCenter = layoutLeft + W * fitScale / 2
+    local rightExtent = halfX + 18 + 360 * fitScale
+    local x = math.clamp(layoutCenter + moveOffset.X, halfX + 8, math.max(halfX + 8, size.X - rightExtent - 8))
+    local baseY = top + available / 2
+    local y = math.clamp(baseY + moveOffset.Y, halfY + 8, math.max(halfY + 8, size.Y - halfY - 8))
+    moveOffset = Vector2.new(x - layoutCenter, y - baseY)
+    musicHomePosition = Vector2.new(musicHomePosition.X + moveOffset.X, y)
+    homePosition = Vector2.new(x, y)
+end
+
+local musicVisibilityTicket = 0
+setMusicVisible = function(value)
+    if not alive then return end
+    state.musicVisible = value
+    musicVisibilityTicket = musicVisibilityTicket + 1
+    local ticket = musicVisibilityTicket
+    musicInput(value and state.open)
+    if value then
+        UI.musicRoot.Visible = state.open
+    end
+    tween(UI.musicPresence, { Value = value and 1 or 0 }, 0.32)
+    if not value then
+        task.delay(state.motion and 0.34 or 0.03, function()
+            if alive and ticket == musicVisibilityTicket and not state.musicVisible then UI.musicRoot.Visible = false end
+        end)
+    end
+end
+bind(UI.hideMusic.Activated, function() setMusicVisible(false) end)
+bind(UI.showMusic.Activated, function() setMusicVisible(true) end)
+setTheme = function(name)
+    if not alive or not palettes[name] then return end
+    state.theme = name
+    for key, value in pairs(palettes[name]) do C[key] = value end
+    for _, entry in ipairs(themeNodes) do
+        if entry.node.Parent then tween(entry.node, { [entry.property] = C[entry.key] }, 0.28) end
+    end
+    for _, refresh in ipairs(switches) do refresh() end
+    for index, item in ipairs(nav) do tween(item.node, { TextColor3 = state.page == index and C.accent or C.muted }, 0.25) end
+end
+UI.themeWhite = button(pages[4], "纯白主题", 30, 429, 374, 48)
+UI.themeBlack = button(pages[4], "纯黑主题", 420, 429, 374, 48)
+bind(UI.themeWhite.Activated, function() setTheme("White") end)
+bind(UI.themeBlack.Activated, function() setTheme("Black") end)
+pages[4].Size = UDim2.fromOffset(824, 487)
+resetPosition = function()
+    moveOffset = Vector2.zero
+    drag = nil
+    fit()
+end
+local function beginDrag(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if drag then return end
+    drag = { input = input, point = Vector2.new(input.Position.X, input.Position.Y), origin = moveOffset }
+end
+bind(UI.header.InputBegan, beginDrag)
+bind(UI.railDrag.InputBegan, beginDrag)
+bind(Input.InputChanged, function(input)
+    if not drag then return end
+    local touch = drag.input.UserInputType == Enum.UserInputType.Touch
+    if (touch and input == drag.input) or (not touch and input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local delta = Vector2.new(input.Position.X, input.Position.Y) - drag.point
+        moveOffset = drag.origin + delta
+        fit()
+    end
+end)
+bind(Input.InputEnded, function(input)
+    if drag and (input == drag.input or (drag.input.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then drag = nil end
+end)
+bind(Input.WindowFocusReleased, function() drag = nil end)
+bind(Input.InputBegan, function(input, processed)
+    if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Config.ToggleKey then setOpen(not state.open) end
+end)
+bind(UI.islandHit.Activated, function()
+    if M.loaded and islandView ~= "alert" then
+        M.expanded = not M.expanded
+        syncIsland()
+    else
+        setOpen(not state.open)
+    end
+end)
+bind(UI.minimize.Activated, function() setOpen(false) end)
+bind(UI.close.Activated, function() setOpen(false) end)
+bind(UI.resetLayout.Activated, resetPosition)
+bind(UI.preview.Activated, function() notify("damage", 20, true) end)
+bind(UI.resetStats.Activated, function()
+    health.hits, health.total, health.peak = 0, 0, 0
+    updateStats()
+end)
+bind(UI.screen:GetPropertyChangedSignal("AbsoluteSize"), fit)
+bind(player.CharacterAdded, attachCharacter)
+bind(player.CharacterRemoving, function(model)
+    if character == model then
+        disconnect(characterConnections)
+        character = nil
+        detachHumanoid()
+    end
+end)
+
+for i = 1, Config.SnowCount do
+    local depth = random:NextNumber(0.2, 1)
+    local diameter = 1.1 + depth * 3
+    local node = frame(UI.snow, "Snowflake", 0, 0, diameter, diameter, Color3.new(1, 1, 1), 8, 1)
+    flakes[i] = {
+        node = node, x = random:NextNumber(), y = random:NextNumber(-0.08, 1),
+        speed = 7 + depth * 15, phase = random:NextNumber(0, math.pi * 2),
+        sway = 5 + depth * 15, opacity = 0.16 + depth * 0.43, depth = depth,
+    }
+end
+
+local snowAlpha, fpsTime, fpsFrames = 0, 0, 0
+local function render(dt)
+    if not alive then return end
+    local step = math.min(dt, 0.05)
+    clock = clock + step
+    local p = UI.progress.Value
+    if state.motion then
+        for _ = 1, 4 do
+            local sub = step / 4
+            islandVelocity = islandVelocity + (-180 * UI.islandJelly.Value - 13 * islandVelocity) * sub
+            UI.islandJelly.Value = UI.islandJelly.Value + islandVelocity * sub
+        end
+    else
+        UI.islandJelly.Value, islandVelocity = 0, 0
+    end
+    if math.abs(UI.islandJelly.Value) < 0.0001 and math.abs(islandVelocity) < 0.001 then
+        UI.islandJelly.Value, islandVelocity = 0, 0
+    end
+    local islandJelly = UI.islandJelly.Value
+    local islandWidth = UI.islandWidth.Value * (1 + islandJelly * 0.45)
+    local islandHeight = UI.islandHeight.Value * (1 - islandJelly * 0.3)
+    if islandWidth ~= islandGeometry.width or islandHeight ~= islandGeometry.height then
+        UI.island.Size = UDim2.fromOffset(islandWidth, islandHeight)
+        islandGeometry.width, islandGeometry.height = islandWidth, islandHeight
+    end
+    local visible = math.clamp(p, 0, 1)
+    UI.shell.GroupTransparency = 1 - visible
+    local travel = math.clamp(UI.travel.Value, 0, 1)
+    local islandCenter = Vector2.new(UI.screen.AbsoluteSize.X / 2, Config.IslandTop + UI.islandHeight.Value * UI.islandScale.Scale / 2)
+    local position = homePosition:Lerp(islandCenter, travel)
+    UI.root.Position = UDim2.fromOffset(position.X, position.Y)
+    UI.scale.Scale = fitScale * UI.zoom.Value
+    UI.shell.Rotation = 0
+    local musicPosition = musicHomePosition:Lerp(islandCenter, travel)
+    UI.musicRoot.Position = UDim2.fromOffset(musicPosition.X, musicPosition.Y)
+    UI.musicScale.Scale = fitScale * UI.zoom.Value * (0.94 + UI.musicPresence.Value * 0.06)
+    UI.musicPanel.GroupTransparency = 1 - visible * UI.musicPresence.Value
+    local musicVisible = UI.root.Visible and UI.musicPresence.Value > 0.002
+    if state.musicVisible or not musicVisible then UI.musicRoot.Visible = musicVisible end
+    local targetSnow = state.open and state.snow and visible or 0
+    snowAlpha = snowAlpha + (targetSnow - snowAlpha) * (1 - math.exp(-step * 3))
+    UI.snow.Visible = snowAlpha > 0.002
+    local snowSize = UI.screen.AbsoluteSize
+    local count = ({ 18, 32, Config.SnowCount })[state.density]
+    local speed = ({ 0.65, 1, 1.6 })[state.snowSpeed]
+    if snowAlpha > 0.002 then
+        for i, flake in ipairs(flakes) do
+            flake.node.Visible = i <= count
+            if i <= count then
+                flake.y = flake.y + step * flake.speed * speed / math.max(snowSize.Y, 1)
+                if flake.y > 1.02 then flake.y = -0.03; flake.x = random:NextNumber() end
+                flake.node.Position = UDim2.fromOffset(flake.x * snowSize.X + math.sin(clock * 0.35 + flake.phase) * flake.sway,
+                    flake.y * snowSize.Y)
+                flake.node.BackgroundTransparency = 1 - flake.opacity * snowAlpha
+            end
+        end
+    end
+    if state.open and state.page == 1 and state.motion then
+        scene.model:PivotTo(CFrame.new(0, math.sin(clock * 0.7) * 0.12, 0) * CFrame.Angles(0.12, clock * 0.18, 0.12) * scene.pivot)
+        scene.camera.CFrame = CFrame.lookAt(Vector3.new(tilt.X * 0.65, 0.8 - tilt.Y * 0.5, 10.2), Vector3.zero)
+    end
+    if islandExpanded and island.deadline <= os.clock() then
+        island.mode, island.demo = "idle", false
+        refreshHealth(false)
+    end
+    syncIsland()
+    UI.alert.Visible = islandView == "alert" or UI.alert.GroupTransparency < 0.999
+    UI.idle.Visible = islandView == "idle" or UI.idle.GroupTransparency < 0.999
+    M.capsule.Visible = islandView == "music" or M.capsule.GroupTransparency < 0.999
+    M.detail.Visible = islandView == "detail" or M.detail.GroupTransparency < 0.999
+    local low = health.bound and health.current > 0 and health.current / math.max(health.maximum, 1) <= 0.25
+    UI.idleDot.BackgroundTransparency = low and state.motion and (0.25 + math.sin(clock * 4) * 0.23) or 0
+    M.tick(step, clock)
+    UI.snowTitle.Text = state.snow and "一场慢雪" or "此刻，晴朗"
+    UI.quickSnow.Text = state.snow and "落雪已开启" or "开启落雪"
+    fpsTime, fpsFrames = fpsTime + dt, fpsFrames + 1
+    if fpsTime >= 0.75 then
+        UI.fps.Text = string.format("LIVE / %d FPS", math.floor(fpsFrames / fpsTime + 0.5))
+        UI.timeText.Text = os.date("%H:%M")
+        fpsTime, fpsFrames = 0, 0
+    end
+end
+bind(RunService.RenderStepped, render)
+local function cleanup()
+    if not alive then return end
+    alive = false
+    drag = nil
+    disconnect(connections)
+    disconnect(characterConnections)
+    disconnect(humanoidConnections)
+    M.version, M.searchVersion = M.version + 1, M.searchVersion + 1
+    if M.sound then M.sound:Stop(); M.sound:Destroy() end
+    disconnect(M.resultConnections)
+    local pending = {}
+    for _, bag in pairs(tracks) do
+        for _, animation in pairs(bag) do pending[animation] = true end
+    end
+    table.clear(tracks)
+    for animation in pairs(pending) do animation:Cancel() end
+end
+destroy = function()
+    if not alive then return end
+    cleanup()
+    UI.gui:Destroy()
+end
+bind(UI.gui.Destroying, cleanup)
+musicInput(false)
+setPage(1)
+refreshHealth(true)
+if player.Character then attachCharacter(player.Character) end
+task.defer(function()
+    if not alive then return end
+    fit()
+    setOpen(true)
+end)
+
+return {
+    Open = function() setOpen(true) end,
+    Close = function() setOpen(false) end,
+    Toggle = function() setOpen(not state.open) end,
+    PreviewDamage = function() notify("damage", 20, true) end,
+    StopMusic = function() M.stop() end,
+    SetTheme = setTheme,
+    ShowMusic = setMusicVisible,
+    Destroy = destroy,
+}
